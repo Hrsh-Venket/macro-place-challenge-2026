@@ -58,15 +58,19 @@ class EfficientPlacer:
 
     def __init__(
         self,
-        grid_size: int = 128,
+        grid_size: int = 512,
         num_starts: int = 3,
         seed: int = 0,
         overlap_gap: float = 1e-3,
+        radial_steps: int = 200,
+        radial_angles: int = 16,
     ) -> None:
         self.grid_size = grid_size
         self.num_starts = num_starts
         self.seed = seed
         self.overlap_gap = overlap_gap
+        self.radial_steps = radial_steps
+        self.radial_angles = radial_angles
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         rng = np.random.default_rng(self.seed)
@@ -161,6 +165,78 @@ class EfficientPlacer:
                 offsets = np.zeros((owners.shape[0], 2), dtype=np.float64)
                 nets.append((owners, offsets))
         return nets
+
+    # ----------------------------------------------------------- radial fallback
+
+    def _radial_search(
+        self,
+        target_x: float,
+        target_y: float,
+        mw: float,
+        mh: float,
+        half_w: float,
+        half_h: float,
+        cw: float,
+        ch: float,
+        placed_hards: List[int],
+        positions_np: np.ndarray,
+        sizes_np: np.ndarray,
+        gap: float,
+    ) -> Tuple[float, float]:
+        """Find the nearest non-overlapping center starting from (target_x, target_y).
+
+        Spirals outward in continuous coordinates so that — unlike the discrete
+        grid — narrow feasible windows between macros are not missed. If no
+        legal spot is found within the search budget, returns the closest
+        candidate that minimises overlap area (last-resort).
+        """
+        if not placed_hards:
+            return target_x, target_y
+
+        ph_pos = positions_np[placed_hards]    # [P, 2]
+        ph_size = sizes_np[placed_hards]        # [P, 2]
+        tx = (mw + ph_size[:, 0]) / 2.0 + gap   # [P]
+        ty = (mh + ph_size[:, 1]) / 2.0 + gap   # [P]
+
+        def overlap_area(cx: float, cy: float) -> float:
+            ox = np.maximum(tx - np.abs(cx - ph_pos[:, 0]), 0.0)
+            oy = np.maximum(ty - np.abs(cy - ph_pos[:, 1]), 0.0)
+            return float((ox * oy).sum())
+
+        def is_legal(cx: float, cy: float) -> bool:
+            if cx < half_w - 1e-9 or cx > cw - half_w + 1e-9:
+                return False
+            if cy < half_h - 1e-9 or cy > ch - half_h + 1e-9:
+                return False
+            dxg = np.abs(cx - ph_pos[:, 0])
+            dyg = np.abs(cy - ph_pos[:, 1])
+            return not bool(((dxg < tx) & (dyg < ty)).any())
+
+        if is_legal(target_x, target_y):
+            return target_x, target_y
+
+        # Step size: a fraction of the smaller macro dimension, but at least
+        # the gap so we don't waste iterations.
+        step = max(min(mw, mh) * 0.05, gap * 2.0, min(cw, ch) / 1024.0)
+        best_cx, best_cy = target_x, target_y
+        best_overlap = overlap_area(target_x, target_y)
+
+        for r_step in range(1, self.radial_steps + 1):
+            radius = step * r_step
+            for a in range(self.radial_angles):
+                theta = 2.0 * math.pi * a / self.radial_angles
+                cx = target_x + radius * math.cos(theta)
+                cy = target_y + radius * math.sin(theta)
+                cx = float(np.clip(cx, half_w, cw - half_w))
+                cy = float(np.clip(cy, half_h, ch - half_h))
+                if is_legal(cx, cy):
+                    return cx, cy
+                ov = overlap_area(cx, cy)
+                if ov < best_overlap:
+                    best_overlap = ov
+                    best_cx, best_cy = cx, cy
+
+        return best_cx, best_cy
 
     # ------------------------------------------------------------------- greedy
 
@@ -303,8 +379,16 @@ class EfficientPlacer:
                     cx = float(gx_centers[gx])
                     cy = float(gy_centers[gy])
                 else:
-                    cx = float(np.clip(positions_np[macro_idx, 0], half_w, cw - half_w))
-                    cy = float(np.clip(positions_np[macro_idx, 1], half_h, ch - half_h))
+                    # Continuous-coordinate radial search outward from the
+                    # macro's initial position. Guarantees a non-overlapping
+                    # placement when one exists in continuous space, even when
+                    # the discrete grid sees no feasible cell.
+                    target_x = float(np.clip(positions_np[macro_idx, 0], half_w, cw - half_w))
+                    target_y = float(np.clip(positions_np[macro_idx, 1], half_h, ch - half_h))
+                    cx, cy = self._radial_search(
+                        target_x, target_y, mw, mh, half_w, half_h, cw, ch,
+                        placed_hards, positions_np, sizes_np, gap,
+                    )
             else:
                 min_val = wm.min()
                 # Match EfficientPlace's act_greedy: random tie-break among argmin.
