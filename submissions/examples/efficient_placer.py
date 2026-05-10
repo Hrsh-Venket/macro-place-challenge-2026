@@ -524,19 +524,19 @@ class EfficientPlacer:
         # ── Placement-time grid & legalization ──
         grid_size: int = 512,
         num_starts: int = 3,
-        seed: int = 0,
+        seed: int = 101, #lol
         overlap_gap: float = 1e-3,
         radial_steps: int = 200,
         radial_angles: int = 16,
         # ── Training switches ──
         train: bool = True,
-        train_grid_size: int = 128,        # CNN grid (must be 128, 256, 512, …)
-        train_loops: int = 20,             # outer PPO loops
-        episodes_per_loop: int = 4,
-        update_epochs: int = 4,
-        batch_size: int = 64,
-        max_train_macros: int = 64,        # cap macros placed by the policy per episode
-        train_time_budget: float = 600.0,  # hard wall-clock cap (seconds)
+        train_grid_size: int = 512,        # CNN grid (must be 128, 256, 512, …)
+        train_loops: int = 1000,            # outer PPO loops (upstream uses 1000)
+        episodes_per_loop: int = 5,
+        update_epochs: int = 10,
+        batch_size: int = 128,
+        max_train_macros: int = 128,       # cap macros placed by the policy per episode
+        train_time_budget: float = 3600.0, # hard wall-clock cap (seconds, 1h)
         # ── PPO hyperparameters ──
         lr_actor: float = 4e-4,
         lr_critic: float = 1e-3,
@@ -547,8 +547,8 @@ class EfficientPlacer:
         max_grad_norm: float = 0.5,
         gamma: float = 1.0,
         # ── Compute ──
-        device: str = "auto",
-        verbose: bool = False,
+        device: str = "cuda",
+        verbose: bool = True,
     ) -> None:
         self.grid_size = grid_size
         self.num_starts = num_starts
