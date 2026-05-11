@@ -33,9 +33,18 @@
 
 set -euo pipefail
 
-# ── Locate the repo (this script lives in <repo>/scripts/) ───────────────────
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
-REPO_ROOT="$(cd "$(dirname "${SCRIPT_PATH}")/.." && pwd)"
+# ── Locate the repo ──────────────────────────────────────────────────────────
+# SLURM copies the script into its own spool dir before running, so we can't
+# rely on $BASH_SOURCE / $0 to point at the original file. Use SLURM_SUBMIT_DIR
+# (the dir where `sbatch` was invoked) and walk up until we find pyproject.toml.
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$PWD}"
+while [ "${REPO_ROOT}" != "/" ] && [ ! -f "${REPO_ROOT}/pyproject.toml" ]; do
+    REPO_ROOT="$(dirname "${REPO_ROOT}")"
+done
+if [ ! -f "${REPO_ROOT}/pyproject.toml" ]; then
+    echo "ERROR: could not find repo root (no pyproject.toml at or above ${SLURM_SUBMIT_DIR})" >&2
+    exit 1
+fi
 cd "${REPO_ROOT}"
 
 # ── Per-job output directory ─────────────────────────────────────────────────
