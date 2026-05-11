@@ -186,6 +186,48 @@ class _ReplayBuffer:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Solution pool — stores top-K completed solutions and serves prefix replays
+# so PPO can bootstrap exploration from promising partial trajectories rather
+# than re-deriving the same greedy prefix every episode (paper §3.3, tree
+# search). Simplified vs upstream treelib: top-K list with UCB-style sampling
+# and a sampling-depth that grows once warm-up is complete.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class _SolutionPool:
+    def __init__(self, capacity: int, alpha: float) -> None:
+        self.capacity = capacity
+        self.alpha = alpha
+        # entries: [hpwl, action_list, positions, visit_count]
+        self.solutions: List[List] = []
+        self.prefix_len = 0  # current replay depth; 0 disables replay
+
+    def sample_prefix(self, rng: np.random.Generator) -> List[int]:
+        if not self.solutions or self.prefix_len == 0:
+            return []
+        scores = np.array(
+            [-s[0] + self.alpha / math.sqrt(max(1, s[3])) for s in self.solutions]
+        )
+        idx = int(np.argmax(scores))
+        self.solutions[idx][3] += 1
+        actions = self.solutions[idx][1]
+        return list(actions[: min(self.prefix_len, len(actions))])
+
+    def register(self, actions: List[int], hpwl: float, positions: np.ndarray) -> None:
+        if not math.isfinite(hpwl):
+            return
+        self.solutions.append([hpwl, list(actions), positions, 1])
+        self.solutions.sort(key=lambda s: s[0])
+        self.solutions = self.solutions[: self.capacity]
+
+    def update_frontiers(self, max_prefix: int) -> None:
+        # Advance the replay depth — gradually shifts policy training onto
+        # deeper, harder partial states sampled from the best solutions.
+        if self.solutions:
+            self.prefix_len = min(self.prefix_len + 1, max_prefix)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Sequential placement environment (canvas / wire_mask / position_mask).
 # Operates on a fixed grid of size G; actions are flat grid indices.
 # All overlap and HPWL bookkeeping is done in continuous (micron) coordinates
@@ -203,6 +245,7 @@ class _PlaceEnv:
         gap: float,
         wire_mask_scale: float = 1e4,
         reward_scale: float = 1e3,
+        invalid_action_penalty: float = 1.0,
     ) -> None:
         self.benchmark = benchmark
         self.ordering = ordering
@@ -211,6 +254,7 @@ class _PlaceEnv:
         self.gap = gap
         self.wire_mask_scale = wire_mask_scale
         self.reward_scale = reward_scale
+        self.invalid_action_penalty = invalid_action_penalty
 
         n_hard = benchmark.num_hard_macros
         n_total = benchmark.num_macros
@@ -364,6 +408,10 @@ class _PlaceEnv:
     def step(self, action: int) -> Tuple[torch.Tensor, float, bool, dict]:
         macro_idx = self.ordering[self.t]
         gx, gy = divmod(int(action), self.G)
+        # Upstream-faithful invalid-action penalty: if the chosen cell was in
+        # the position_mask (illegal), the step still places the macro (clipped
+        # to canvas) but the agent is penalised.
+        invalid = bool(self._cur_state[2, gx, gy].item() >= 0.5)
         cx = float(np.clip(self.gx_centers[gx], self.sizes_np[macro_idx, 0] / 2.0,
                            self.cw - self.sizes_np[macro_idx, 0] / 2.0))
         cy = float(np.clip(self.gy_centers[gy], self.sizes_np[macro_idx, 1] / 2.0,
@@ -398,10 +446,12 @@ class _PlaceEnv:
         self.placed_hards.append(macro_idx)
 
         reward = -delta / self.reward_scale
+        if invalid:
+            reward = -self.invalid_action_penalty
         self.t += 1
         done = self.t >= self.n_steps
         self._cur_state = self._state_tensor()
-        return self._cur_state, reward, done, {"delta_hpwl": delta}
+        return self._cur_state, reward, done, {"delta_hpwl": delta, "invalid": invalid}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -436,6 +486,22 @@ class _Agent:
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
         self.gamma = gamma
+
+    @staticmethod
+    def act_greedy(state: torch.Tensor, rng: np.random.Generator) -> int:
+        # Pure argmin wire_mask among legal cells (random tie-break) — no actor.
+        pos_mask = state[2].numpy() >= 0.5
+        wire = state[1].numpy().astype(np.float64)
+        wm = np.where(pos_mask, np.inf, wire)
+        if not np.isfinite(wm).any():
+            legal = ~pos_mask
+            if legal.any():
+                flat = np.flatnonzero(legal.ravel())
+                return int(rng.choice(flat))
+            return int(np.argmin(wire))
+        min_val = wm.min()
+        cands = np.flatnonzero(wm.ravel() == min_val)
+        return int(rng.choice(cands))
 
     @torch.no_grad()
     def act(self, state: torch.Tensor, t: int, deterministic: bool = False) -> Tuple[int, float]:
@@ -536,14 +602,20 @@ class EfficientPlacer:
         update_epochs: int = 10,
         batch_size: int = 128,
         max_train_macros: int = 128,       # cap macros placed by the policy per episode
-        train_time_budget: float = 3600.0, # hard wall-clock cap (seconds, 1h)
+        train_time_budget: float = 7200.0, # hard wall-clock cap (seconds, 1h)
+        # ── SolutionPool / frontier replay (paper §3.3) ──
+        solution_pool_size: int = 5,
+        solution_pool_alpha: float = 0.1,
+        update_frontiers_begin: int = 200,   # loop at which to start growing prefix depth
+        update_frontiers_freq: int = 2,      # grow every N loops thereafter
+        invalid_action_penalty: float = 1.0,
         # ── PPO hyperparameters ──
         lr_actor: float = 4e-4,
         lr_critic: float = 1e-3,
         actor_lr_anneal: float = 0.9999,
         critic_lr_anneal: float = 0.9999,
         clip_epsilon: float = 0.2,
-        entropy_coef: float = 1e-3,
+        entropy_coef: float = 1e-2,
         max_grad_norm: float = 0.5,
         gamma: float = 1.0,
         # ── Compute ──
@@ -565,6 +637,11 @@ class EfficientPlacer:
         self.batch_size = batch_size
         self.max_train_macros = max_train_macros
         self.train_time_budget = train_time_budget
+        self.solution_pool_size = solution_pool_size
+        self.solution_pool_alpha = solution_pool_alpha
+        self.update_frontiers_begin = update_frontiers_begin
+        self.update_frontiers_freq = update_frontiers_freq
+        self.invalid_action_penalty = invalid_action_penalty
 
         self.lr_actor = lr_actor
         self.lr_critic = lr_critic
@@ -607,17 +684,17 @@ class EfficientPlacer:
 
         # ── Optional PPO training ──
         if self.train and n_hard > 1:
-            train_order = orderings[0][: min(self.max_train_macros, n_hard)]
+            full_order = orderings[0]
+            num_policy = min(self.max_train_macros, len(full_order))
             best_train_pos, best_train_hpwl = self._train(
-                benchmark, train_order, net_meta
+                benchmark, full_order, num_policy, net_meta, rng
             )
             if best_train_pos is not None:
-                # Trained-policy rollouts placed only `train_order` macros at
-                # train_grid_size; remaining macros stay at init. Re-run greedy on the
-                # full ordering at full grid_size starting from those positions —
-                # i.e. fix the trained ones and let greedy fill the rest.
+                # SolutionPool stores fully-completed episodes (policy + tail-greedy),
+                # so best_train_pos already covers all hard macros at train_grid_size.
+                # Re-snap them on the full placement grid for a final HPWL number.
                 refined_pos, refined_cost = self._refine_with_trained(
-                    benchmark, orderings[0], net_meta, best_train_pos, train_order, rng
+                    benchmark, full_order, net_meta, best_train_pos, full_order, rng
                 )
                 candidates.append((refined_cost, refined_pos))
                 if self.verbose:
@@ -735,22 +812,30 @@ class EfficientPlacer:
     def _train(
         self,
         benchmark: Benchmark,
-        order: List[int],
+        full_order: List[int],
+        num_policy: int,
         net_meta: List[Tuple[np.ndarray, np.ndarray]],
+        rng: np.random.Generator,
     ) -> Tuple[Optional[np.ndarray], float]:
         """Run PPO on this benchmark for up to `train_loops` loops or until the
-        wall-clock budget is exhausted. Returns (best_positions[:n_hard], best_hpwl).
+        wall-clock budget is exhausted. The env places every macro in
+        `full_order`; the policy makes `num_policy` decisions per episode and a
+        greedy tail places the rest. Returns (best_positions[:n_hard], best_hpwl).
         """
         env = _PlaceEnv(
-            benchmark, order, net_meta, grid=self.train_grid_size, gap=self.overlap_gap,
+            benchmark, full_order, net_meta, grid=self.train_grid_size,
+            gap=self.overlap_gap, invalid_action_penalty=self.invalid_action_penalty,
         )
+        # Time-embedding size only needs to cover policy steps (greedy tail
+        # never queries the actor by step index).
         agent = _Agent(
-            num_steps=env.n_steps, grid=self.train_grid_size, device=self.device,
+            num_steps=max(1, num_policy), grid=self.train_grid_size, device=self.device,
             lr_actor=self.lr_actor, lr_critic=self.lr_critic,
             actor_lr_anneal=self.actor_lr_anneal, critic_lr_anneal=self.critic_lr_anneal,
             clip_epsilon=self.clip_epsilon, entropy_coef=self.entropy_coef,
             max_grad_norm=self.max_grad_norm, gamma=self.gamma,
         )
+        pool = _SolutionPool(self.solution_pool_size, self.solution_pool_alpha)
 
         best_hpwl = math.inf
         best_positions: Optional[np.ndarray] = None
@@ -762,20 +847,28 @@ class EfficientPlacer:
                     print(f"  [train] budget exhausted after loop {loop}")
                 break
             buffer = _ReplayBuffer(
-                capacity=self.episodes_per_loop * env.n_steps,
+                capacity=self.episodes_per_loop * max(1, num_policy),
                 grid=self.train_grid_size,
             )
             for _ep in range(self.episodes_per_loop):
-                hpwl, ep_positions = self._run_episode(env, agent, buffer)
+                hpwl, ep_positions = self._run_episode(
+                    env, agent, buffer, pool, num_policy, rng,
+                )
                 if hpwl < best_hpwl:
                     best_hpwl = hpwl
                     best_positions = ep_positions.copy()
                 if time.time() - t_start > self.train_time_budget:
                     break
             stats = agent.update(buffer, self.update_epochs, self.batch_size)
+            if (
+                loop >= self.update_frontiers_begin
+                and (loop - self.update_frontiers_begin) % self.update_frontiers_freq == 0
+            ):
+                pool.update_frontiers(num_policy)
             if self.verbose:
                 print(
                     f"  [train] loop {loop} best_hpwl={best_hpwl:.2f} "
+                    f"prefix={pool.prefix_len} "
                     f"actor={stats['actor_loss']:.4f} critic={stats['critic_loss']:.4f} "
                     f"entropy={stats['entropy']:.4f}"
                 )
@@ -783,26 +876,57 @@ class EfficientPlacer:
         return best_positions, best_hpwl
 
     def _run_episode(
-        self, env: _PlaceEnv, agent: _Agent, buffer: _ReplayBuffer
+        self,
+        env: _PlaceEnv,
+        agent: _Agent,
+        buffer: _ReplayBuffer,
+        pool: _SolutionPool,
+        num_policy: int,
+        rng: np.random.Generator,
     ) -> Tuple[float, np.ndarray]:
+        prefix = pool.sample_prefix(rng)
         s = env.reset()
         total_hpwl = 0.0
-        t = 0
-        while True:
-            # Guard against the actor seeing a fully-blocked position_mask.
-            if s[2].min() >= 0.5:
+        policy_actions: List[int] = []
+        first_stored_idx = buffer.count
+        done = False
+
+        # ── Policy phase (with deterministic prefix replay) ──
+        for t in range(num_policy):
+            if t < len(prefix):
+                action = int(prefix[t])
+                a_logp = 0.0
+            elif s[2].min() >= 0.5:
+                # Fully-blocked mask — actor cannot produce a distribution.
                 action = self._fallback_action(env)
                 a_logp = 0.0
             else:
                 action, a_logp = agent.act(s, t, deterministic=False)
             s_next, reward, done, info = env.step(action)
-            buffer.store(s, t, action, a_logp, reward, 1.0 if done else 0.0)
+            policy_actions.append(action)
+            if t >= len(prefix):
+                buffer.store(s, t, action, a_logp, reward, 0.0)
             total_hpwl += info["delta_hpwl"]
             s = s_next
-            t += 1
             if done:
                 break
-        return total_hpwl, env.positions_np[:env.n_hard].copy()
+
+        # ── Tail-greedy completion ──
+        tail_r = 0.0
+        while not done:
+            action = _Agent.act_greedy(s.cpu(), rng)
+            s, reward, done, info = env.step(action)
+            tail_r += reward
+            total_hpwl += info["delta_hpwl"]
+
+        # Patch the last stored transition: accumulate tail reward, mark done.
+        if buffer.count > first_stored_idx:
+            buffer.r[buffer.count - 1] += tail_r
+            buffer.done[buffer.count - 1] = 1.0
+
+        positions = env.positions_np[: env.n_hard].copy()
+        pool.register(policy_actions, total_hpwl, positions)
+        return total_hpwl, positions
 
     @staticmethod
     def _fallback_action(env: _PlaceEnv) -> int:
