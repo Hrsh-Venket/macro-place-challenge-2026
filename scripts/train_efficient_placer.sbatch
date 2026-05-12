@@ -47,6 +47,11 @@ if [ ! -f "${REPO_ROOT}/pyproject.toml" ]; then
 fi
 cd "${REPO_ROOT}"
 
+# ── Submodules (plc_client_os lives in external/MacroPlacement) ──────────────
+if [ ! -f "${REPO_ROOT}/external/MacroPlacement/CodeElements/Plc_client/plc_client_os.py" ]; then
+    git -C "${REPO_ROOT}" submodule update --init --recursive
+fi
+
 # ── Per-job output directory ─────────────────────────────────────────────────
 RUN_DIR="${REPO_ROOT}/runs/${SLURM_JOB_ID}"
 mkdir -p "${RUN_DIR}/vis"
