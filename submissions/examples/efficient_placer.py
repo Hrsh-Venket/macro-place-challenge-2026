@@ -611,11 +611,11 @@ class EfficientPlacer:
         invalid_action_penalty: float = 1.0,
         # ── PPO hyperparameters ──
         lr_actor: float = 4e-4,
-        lr_critic: float = 1e-3,
+        lr_critic: float = 1e-1,
         actor_lr_anneal: float = 0.9999,
         critic_lr_anneal: float = 0.9999,
         clip_epsilon: float = 0.2,
-        entropy_coef: float = 1e-2,
+        entropy_coef: float = 1e-1,
         max_grad_norm: float = 0.5,
         gamma: float = 1.0,
         # ── Compute ──

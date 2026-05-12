@@ -29,7 +29,7 @@
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 # Uncomment and set if your SuperPod account spans multiple projects:
-##SBATCH --account=<your_project>
+#SBATCH --account=mscaisuperpod
 
 set -euo pipefail
 
