@@ -473,6 +473,7 @@ class _Agent:
         entropy_coef: float,
         max_grad_norm: float,
         gamma: float,
+        gae_lambda: float,
     ) -> None:
         self.actor = _Actor(num_steps, grid).to(device)
         self.critic = _Critic(num_steps, grid).to(device)
@@ -486,6 +487,7 @@ class _Agent:
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
         self.gamma = gamma
+        self.gae_lambda = gae_lambda
 
     @staticmethod
     def act_greedy(state: torch.Tensor, rng: np.random.Generator) -> int:
@@ -526,17 +528,20 @@ class _Agent:
         if s.shape[0] < 2:
             return {"actor_loss": 0.0, "critic_loss": 0.0, "entropy": 0.0}
 
-        # Discounted returns over per-episode segments (done resets target to 0).
+        # GAE(λ) advantages with λ-return as critic target. Upstream uses λ=0.98.
+        # δ_i = r_i + γ V(s_{i+1})·(1-done_i) - V(s_i); A_i = δ_i + γλ·A_{i+1}·(1-done_i)
         with torch.no_grad():
-            v_target = torch.zeros_like(r)
-            target = 0.0
-            for i in range(s.shape[0] - 1, -1, -1):
-                if bool(done[i].item()):
-                    target = 0.0
-                target = r[i].item() + self.gamma * target
-                v_target[i] = target
             v_pred = self.critic(s, t)
-            adv = v_target - v_pred
+            n = s.shape[0]
+            adv = torch.zeros_like(r)
+            gae = 0.0
+            for i in range(n - 1, -1, -1):
+                done_i = bool(done[i].item())
+                next_v = 0.0 if done_i or i + 1 >= n else float(v_pred[i + 1].item())
+                delta = r[i].item() + self.gamma * next_v - float(v_pred[i].item())
+                gae = delta + self.gamma * self.gae_lambda * (0.0 if done_i else gae)
+                adv[i] = gae
+            v_target = adv + v_pred
             adv = (adv - adv.mean()) / (adv.std() + 1e-5)
 
         actor_loss_avg = critic_loss_avg = entropy_avg = 0.0
@@ -611,13 +616,14 @@ class EfficientPlacer:
         invalid_action_penalty: float = 1.0,
         # ── PPO hyperparameters ──
         lr_actor: float = 4e-4,
-        lr_critic: float = 1e-1,
+        lr_critic: float = 1e-3,
         actor_lr_anneal: float = 0.9999,
         critic_lr_anneal: float = 0.9999,
         clip_epsilon: float = 0.2,
-        entropy_coef: float = 1e-1,
+        entropy_coef: float = 1e-3,
         max_grad_norm: float = 0.5,
         gamma: float = 1.0,
+        gae_lambda: float = 0.98,
         # ── Compute ──
         device: str = "cuda",
         verbose: bool = True,
@@ -651,6 +657,7 @@ class EfficientPlacer:
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
         self.gamma = gamma
+        self.gae_lambda = gae_lambda
 
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -834,12 +841,14 @@ class EfficientPlacer:
             actor_lr_anneal=self.actor_lr_anneal, critic_lr_anneal=self.critic_lr_anneal,
             clip_epsilon=self.clip_epsilon, entropy_coef=self.entropy_coef,
             max_grad_norm=self.max_grad_norm, gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
         )
         pool = _SolutionPool(self.solution_pool_size, self.solution_pool_alpha)
 
         best_hpwl = math.inf
         best_positions: Optional[np.ndarray] = None
         t_start = time.time()
+        global_episode = 0
 
         for loop in range(self.train_loops):
             if time.time() - t_start > self.train_time_budget:
@@ -854,6 +863,7 @@ class EfficientPlacer:
                 hpwl, ep_positions = self._run_episode(
                     env, agent, buffer, pool, num_policy, rng,
                 )
+                global_episode += 1
                 if hpwl < best_hpwl:
                     best_hpwl = hpwl
                     best_positions = ep_positions.copy()
@@ -861,8 +871,8 @@ class EfficientPlacer:
                     break
             stats = agent.update(buffer, self.update_epochs, self.batch_size)
             if (
-                loop >= self.update_frontiers_begin
-                and (loop - self.update_frontiers_begin) % self.update_frontiers_freq == 0
+                global_episode >= self.update_frontiers_begin
+                and loop % self.update_frontiers_freq == 0
             ):
                 pool.update_frontiers(num_policy)
             if self.verbose:
