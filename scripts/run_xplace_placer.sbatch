@@ -1,0 +1,245 @@
+#!/bin/bash
+# ──────────────────────────────────────────────────────────────────────────────
+# SLURM job: evaluate the XplacePlacer on a GPU node.
+#
+# Pipeline:
+#   1. Locate repo root from the submit dir
+#   2. Initialise the TILOS submodule (plc_client_os) if missing
+#   3. Install / refresh uv venv from pyproject.toml
+#   4. Build Xplace at $XPLACE_ROOT (default: $HOME/Xplace) if not already built
+#   5. Run `uv run evaluate submissions/xplace_placer/placer.py …`
+#   6. Stash everything (stdout, env, vis/, slurm raw logs) under runs/<jobid>/
+#
+# Submit:
+#   sbatch /path/to/repo/scripts/run_xplace_placer.sbatch
+#
+# Override defaults at submit time:
+#   sbatch --export=ALL,XPLACE_BENCH="-b ibm03" ./run_xplace_placer.sbatch
+#   sbatch --export=ALL,XPLACE_BENCH="--ng45" ./run_xplace_placer.sbatch
+#   sbatch --export=ALL,XPLACE_BENCH="--all --vis" ./run_xplace_placer.sbatch
+#   sbatch --export=ALL,XPLACE_ROOT=/scratch/$USER/Xplace ./run_xplace_placer.sbatch
+#
+# Skip the Xplace stage entirely (CD only — useful for plumbing tests):
+#   sbatch --export=ALL,SKIP_XPLACE=1 ./run_xplace_placer.sbatch
+#
+# Artefacts:
+#   runs/<jobid>/stdout.log       full evaluate stdout+stderr
+#   runs/<jobid>/env.txt          host / GPU / torch / Xplace versions
+#   runs/<jobid>/xplace_build.log Xplace build log (only first install)
+#   runs/<jobid>/slurm.out        symlink to SLURM's raw stdout
+#   runs/<jobid>/slurm.err        symlink to SLURM's raw stderr
+#   runs/<jobid>/vis/             placement images (if --vis was passed)
+# ──────────────────────────────────────────────────────────────────────────────
+
+#SBATCH --job-name=xplace_placer
+#SBATCH --partition=normal
+#SBATCH --nodes=1
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=14
+#SBATCH --mem=224G
+#SBATCH --time=08:00:00
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
+#SBATCH --account=mscaisuperpod
+
+set -euo pipefail
+
+# ── Configurable knobs (override via --export=ALL,KEY=VAL) ──────────────────
+: "${XPLACE_BENCH:=--all}"          # default: all 17 IBM benchmarks
+: "${XPLACE_REPO:=https://github.com/cuhk-eda/Xplace.git}"
+: "${XPLACE_REF:=main}"
+: "${XPLACE_ROOT:=$HOME/Xplace}"
+: "${SKIP_XPLACE:=0}"               # set 1 to skip Xplace build/run (CD-only)
+
+export XPLACE_ROOT
+
+# ── Locate the repo root ────────────────────────────────────────────────────
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$PWD}"
+while [ "${REPO_ROOT}" != "/" ] && [ ! -f "${REPO_ROOT}/pyproject.toml" ]; do
+    REPO_ROOT="$(dirname "${REPO_ROOT}")"
+done
+if [ ! -f "${REPO_ROOT}/pyproject.toml" ]; then
+    echo "ERROR: no pyproject.toml at or above ${SLURM_SUBMIT_DIR}" >&2
+    exit 1
+fi
+cd "${REPO_ROOT}"
+
+# ── Submodule init (TILOS MacroPlacement / plc_client_os) ───────────────────
+if [ ! -f "${REPO_ROOT}/external/MacroPlacement/CodeElements/Plc_client/plc_client_os.py" ]; then
+    git -C "${REPO_ROOT}" submodule update --init --recursive
+fi
+
+# ── Per-job output dir ──────────────────────────────────────────────────────
+RUN_DIR="${REPO_ROOT}/runs/${SLURM_JOB_ID}"
+mkdir -p "${RUN_DIR}/vis"
+
+SLURM_STDOUT="${SLURM_SUBMIT_DIR}/slurm-${SLURM_JOB_ID}.out"
+SLURM_STDERR="${SLURM_SUBMIT_DIR}/slurm-${SLURM_JOB_ID}.err"
+[ -e "${SLURM_STDOUT}" ] && ln -sf "${SLURM_STDOUT}" "${RUN_DIR}/slurm.out"
+[ -e "${SLURM_STDERR}" ] && ln -sf "${SLURM_STDERR}" "${RUN_DIR}/slurm.err"
+
+# ── Modules ─────────────────────────────────────────────────────────────────
+module purge
+module load Anaconda3/2023.09-0 2>/dev/null || module load Anaconda3 2>/dev/null || true
+module load cuda/11.8 2>/dev/null || module load cuda 2>/dev/null || true
+module load gcc/9.3.0 2>/dev/null || module load gcc 2>/dev/null || true
+module load cmake 2>/dev/null || true
+module load boost 2>/dev/null || true
+
+# ── Python environment: prefer uv, fall back to pip+venv ────────────────────
+# HKUST SuperPod compute nodes don't ship uv. The login-node-installed copy
+# at ~/.local/bin is usually on the compute-node $PATH after `module load
+# Anaconda3`, but not guaranteed. If uv isn't available and we can't fetch
+# it (compute nodes often have no outbound internet), we fall back to
+# `python -m venv .venv` + `pip install -e .` from pyproject.toml.
+#
+# After this block:
+#   PYRUN     — wrapper to run a console entry point (e.g., "$PYRUN evaluate ...")
+#   PYBIN     — direct path to the project venv's python
+
+setup_with_uv() {
+    if ! command -v uv >/dev/null 2>&1; then
+        for cand in "${HOME}/.local/bin/uv" "${HOME}/.cargo/bin/uv" /opt/uv/bin/uv; do
+            if [ -x "${cand}" ]; then
+                export PATH="$(dirname "${cand}"):${PATH}"
+                break
+            fi
+        done
+    fi
+    if ! command -v uv >/dev/null 2>&1; then
+        # Bounded install attempt — fail fast if the compute node has no internet.
+        echo "[env] uv not found, attempting install (10s timeout)..."
+        if timeout 30 curl -LsSf https://astral.sh/uv/install.sh -o /tmp/uv-install.sh 2>/dev/null \
+           && timeout 60 sh /tmp/uv-install.sh >/dev/null 2>&1; then
+            export PATH="${HOME}/.local/bin:${PATH}"
+        else
+            echo "[env] uv install failed (no internet?), will fall back to pip"
+            return 1
+        fi
+    fi
+    uv sync --frozen
+    PYRUN="uv run"
+    PYBIN="${REPO_ROOT}/.venv/bin/python"
+    return 0
+}
+
+setup_with_pip() {
+    # Resolve a working python. Prefer the Anaconda module loaded above.
+    PYTHON_BIN="$(command -v python3 || command -v python)"
+    if [ -z "${PYTHON_BIN}" ]; then
+        echo "ERROR: no python on PATH after module load" >&2
+        return 1
+    fi
+    echo "[env] using ${PYTHON_BIN} ($(${PYTHON_BIN} --version 2>&1))"
+
+    VENV="${REPO_ROOT}/.venv"
+    if [ ! -x "${VENV}/bin/python" ]; then
+        "${PYTHON_BIN}" -m venv "${VENV}"
+    fi
+    # Quote-trick to bypass `set -u` while activating.
+    # shellcheck disable=SC1091
+    . "${VENV}/bin/activate"
+    python -m pip install --upgrade pip wheel setuptools
+
+    # Editable install of macro_place + all runtime deps from pyproject.toml.
+    # If the cluster blocks PyPI, the user must pre-stage a wheelhouse and add
+    # `--no-index --find-links /path/to/wheels` here.
+    python -m pip install -e "${REPO_ROOT}"
+
+    PYRUN="${VENV}/bin/python -m"
+    PYBIN="${VENV}/bin/python"
+    return 0
+}
+
+if ! setup_with_uv; then
+    setup_with_pip
+fi
+
+# Verify the evaluate entry-point is reachable, regardless of how we got here.
+if ! ${PYBIN} -c "from macro_place import evaluate" >/dev/null 2>&1; then
+    echo "ERROR: macro_place.evaluate not importable from ${PYBIN}" >&2
+    exit 1
+fi
+
+# Resolve the command that actually runs `evaluate`. With uv we call
+# `uv run evaluate …`; with the pip fallback we call the console script
+# the editable install dropped into the venv's bin/.
+if [ "${PYRUN}" = "uv run" ]; then
+    EVAL_CMD=(uv run evaluate)
+else
+    EVAL_CMD=("${REPO_ROOT}/.venv/bin/evaluate")
+fi
+
+# ── Build Xplace (idempotent — skipped if XPLACE_ROOT already built) ───────
+build_xplace() {
+    if [ ! -d "${XPLACE_ROOT}/.git" ]; then
+        echo "[xplace-build] cloning ${XPLACE_REPO} (ref ${XPLACE_REF}) → ${XPLACE_ROOT}"
+        git clone --depth 1 --branch "${XPLACE_REF}" "${XPLACE_REPO}" "${XPLACE_ROOT}"
+    fi
+    cd "${XPLACE_ROOT}"
+    # Skip rebuild if the C++/CUDA extensions are already on disk.
+    if find . -maxdepth 3 \( -name '*.so' -o -name 'build' -type d \) 2>/dev/null | grep -q .; then
+        echo "[xplace-build] artefacts already present, skipping rebuild"
+        cd "${REPO_ROOT}"
+        return
+    fi
+    if [ -f requirements.txt ]; then
+        "${PYBIN}" -m pip install -r requirements.txt || true
+    fi
+    if [ -f setup.py ]; then
+        "${PYBIN}" setup.py build_ext --inplace
+    elif [ -f CMakeLists.txt ]; then
+        mkdir -p build && cd build && cmake .. && make -j"${SLURM_CPUS_PER_TASK:-4}"
+    else
+        echo "[xplace-build] WARNING: no setup.py or CMakeLists.txt — Xplace may need manual build steps"
+    fi
+    cd "${REPO_ROOT}"
+}
+
+if [ "${SKIP_XPLACE}" = "0" ]; then
+    build_xplace 2>&1 | tee -a "${RUN_DIR}/xplace_build.log"
+fi
+
+# ── Diagnostics ────────────────────────────────────────────────────────────
+{
+    echo "================================ Job info ================================"
+    echo "Host           : $(hostname)"
+    echo "Job ID         : ${SLURM_JOB_ID}"
+    echo "Submit dir     : ${SLURM_SUBMIT_DIR}"
+    echo "Repo root      : ${REPO_ROOT}"
+    echo "Run dir        : ${RUN_DIR}"
+    echo "XPLACE_ROOT    : ${XPLACE_ROOT}"
+    echo "XPLACE_BENCH   : ${XPLACE_BENCH}"
+    echo "SKIP_XPLACE    : ${SKIP_XPLACE}"
+    echo "Allocated GPUs : ${SLURM_GPUS:-?}"
+    echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+    echo
+    nvidia-smi || echo "(nvidia-smi unavailable)"
+    echo
+    echo "Python runner : ${PYRUN}"
+    echo "Python venv   : ${PYBIN}"
+    "${PYBIN}" -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available(), 'device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')" \
+        || echo "(torch import failed)"
+    echo
+    if [ "${SKIP_XPLACE}" = "0" ] && [ -d "${XPLACE_ROOT}/.git" ]; then
+        echo "Xplace HEAD    : $(git -C "${XPLACE_ROOT}" rev-parse --short HEAD)"
+        echo "Xplace commit  : $(git -C "${XPLACE_ROOT}" log -1 --format='%s' HEAD)"
+    fi
+    echo "=========================================================================="
+} > "${RUN_DIR}/env.txt" 2>&1
+cat "${RUN_DIR}/env.txt"
+
+# ── Run evaluation ─────────────────────────────────────────────────────────
+# Tee combined stdout+stderr to stdout.log so SLURM's slurm-*.out and the
+# run-dir log both contain the live progress.
+set -o pipefail
+"${EVAL_CMD[@]}" submissions/xplace_placer/placer.py ${XPLACE_BENCH} 2>&1 \
+    | tee "${RUN_DIR}/stdout.log"
+
+# Collect visualisations if --vis was requested.
+if [ -d "${REPO_ROOT}/vis" ]; then
+    mv "${REPO_ROOT}/vis"/*.png "${RUN_DIR}/vis/" 2>/dev/null || true
+    rmdir "${REPO_ROOT}/vis" 2>/dev/null || true
+fi
+
+echo "Done. Outputs: ${RUN_DIR}/"
