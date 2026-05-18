@@ -258,7 +258,11 @@ class XplacePlacer:
         self.cd_time_budget_s = cd_time_budget_s
         self.xplace_extra_args = list(xplace_extra_args)
         self.use_gpu = use_gpu
-        self.skip_xplace = skip_xplace
+        # Env-var override: SLURM/sbatch sets SKIP_XPLACE=1 for plumbing tests
+        # but the evaluator instantiates this class with no args, so honour
+        # the env var here.
+        env_skip = os.environ.get("SKIP_XPLACE", "").lower() in ("1", "true", "yes")
+        self.skip_xplace = skip_xplace or env_skip
         self.fd_soft_iters = fd_soft_iters
         self.overlap_gap = overlap_gap
         self.verbose = verbose
@@ -271,9 +275,12 @@ class XplacePlacer:
         if not self.skip_xplace:
             xplace_root = _find_xplace_root()
             if xplace_root is None:
+                searched = [os.environ.get("XPLACE_ROOT", "<unset>")] + _XPLACE_DEFAULT_ROOTS
                 raise RuntimeError(
                     "Xplace not found. Set XPLACE_ROOT or install Xplace at "
-                    "/opt/Xplace (see Dockerfile)."
+                    "/opt/Xplace (see Dockerfile). "
+                    f"Searched: {searched}. "
+                    "To run the CD-only smoke test, set env SKIP_XPLACE=1."
                 )
             with tempfile.TemporaryDirectory(prefix=f"xplace_{benchmark.name}_") as td:
                 td_p = Path(td)
