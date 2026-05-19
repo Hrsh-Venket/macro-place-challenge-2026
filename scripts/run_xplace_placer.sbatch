@@ -228,6 +228,33 @@ build_xplace() {
         git -C "${XPLACE_ROOT}" submodule update --init --recursive
     fi
 
+    # ── Xplace runtime Python deps ──────────────────────────────────────
+    # Xplace's main.py imports pandas/scipy/networkx/pyyaml at runtime, none
+    # of which are macro-place deps. We install them into the same venv so
+    # the `_run_xplace` subprocess (which invokes ${PYBIN} main.py) can find
+    # them. Done BEFORE the build-idempotency check so deps are refreshed
+    # every job, not just on rebuild — `uv sync --frozen` prunes anything
+    # outside the lockfile on each invocation, so this must re-run.
+    #
+    # On HKUST SuperPod, compute nodes may have no outbound internet; this
+    # works anyway because uv's per-user cache (~/.cache/uv) is shared
+    # across login and compute nodes, so wheels downloaded once on the
+    # login node satisfy later compute-node installs offline.
+    install_xplace_runtime_deps() {
+        local req="${XPLACE_ROOT}/requirements.txt"
+        if [ -f "${req}" ]; then
+            echo "[xplace-deps] installing from ${req}"
+            pip_install -r "${req}"
+        else
+            # Fallback: known runtime imports in upstream Xplace main.py +
+            # cpp_to_py helpers. Keep this list tight — every entry here is
+            # a wheel uv has to fetch the first time a user runs this job.
+            echo "[xplace-deps] no requirements.txt in Xplace, installing known set"
+            pip_install pandas pyyaml networkx scipy
+        fi
+    }
+    install_xplace_runtime_deps
+
     # Idempotency: don't just check for .so files — verify the package
     # actually imports under the current venv. This catches ABI drift
     # (e.g., torch was upgraded and now needs the new C++11 ABI).
