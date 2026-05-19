@@ -252,6 +252,21 @@ build_xplace() {
         echo "[xplace-build] patched out draw_placement (no Cairo on cluster)"
     fi
 
+    # cpp_to_py/__init__.py unconditionally does `from .cpybin import draw_placement`.
+    # Since we skipped the subdir above, that .so was never built — the post-install
+    # `import cpp_to_py.cpybin` check fails with:
+    #   ImportError: cannot import name 'draw_placement' from 'cpp_to_py.cpybin'
+    CPP_INIT="${XPLACE_ROOT}/cpp_to_py/__init__.py"
+    if grep -q 'draw_placement' "${CPP_INIT}"; then
+        # Drop `draw_placement` line inside a multi-line `from .cpybin import (...)`
+        sed -i '/^[[:space:]]*draw_placement,\?[[:space:]]*$/d' "${CPP_INIT}"
+        # Drop `, draw_placement` / `draw_placement,` on single-line imports
+        sed -i 's/,[[:space:]]*draw_placement\b//g; s/\bdraw_placement[[:space:]]*,[[:space:]]*//g' "${CPP_INIT}"
+        # Drop any bare `draw_placement` reference (e.g. __all__ entries)
+        sed -i 's/^[[:space:]]*draw_placement[[:space:]]*$//; s/"draw_placement",\?//g; s/'\''draw_placement'\'',\?//g' "${CPP_INIT}"
+        echo "[xplace-build] patched out draw_placement import in cpp_to_py/__init__.py"
+    fi
+
     # cmake on this cluster: system is 3.22.1 (< Xplace's 3.24 floor) and
     # there is no cmake module → pip-install into the venv and call by
     # absolute path. Pin cmake≥3.28: cmake 3.27 had a regression where the
