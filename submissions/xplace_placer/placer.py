@@ -83,36 +83,49 @@ def _run_xplace(
     timeout_s: float = 1800.0,
 ) -> Path:
     """Invoke Xplace on a Bookshelf design and return the path to its
-    placed .pl. The exact flag set has shifted across Xplace versions —
-    we pass the common subset and let ``extra_args`` carry per-version
-    overrides.
+    placed .pl.
 
-    Expected Xplace produces an output .pl named ``<design>.gp.pl``
-    (or similar) in ``out_dir``.  We tolerate any single ``*.pl`` that
-    appears.
+    The Xplace CLI (verified against cuhk-eda/Xplace main) uses
+    ``--custom_path`` with comma-separated tokens for inputs and
+    ``--result_dir``/``--exp_id`` for outputs.  Bookshelf inputs need
+    ``bookshelf_variety:ispd2005`` (covers the IBM/ISPD2005 lineage,
+    which is what our writer emits).
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    design = aux_path.stem  # design name
+    design = aux_path.stem
+    custom_path = ",".join([
+        f"aux:{aux_path}",
+        f"benchmark:custom_{design}",
+        f"design_name:{design}",
+        "bookshelf_variety:ispd2005",
+    ])
+    exp_id = f"{design}_run"
     cmd = [
         sys.executable, "main.py",
-        "--dataset_format", "bookshelf",
-        "--aux", str(aux_path),
-        "--output_dir", str(out_dir),
+        "--custom_path", custom_path,
+        "--load_from_raw", "True",
         "--target_density", f"{target_density:.4f}",
-        "--use_cell_inflate", "false",
-        "--deterministic", "true",
+        "--deterministic", "True",
+        # We do our own legalization/polish; ask Xplace for GP only so it
+        # writes the global-placement .pl and skips its detailed placer
+        # (which expects a real LEF/DEF cell library).
+        "--detail_placement", "False",
+        "--legalization", "False",
+        "--result_dir", str(out_dir),
+        "--exp_id", exp_id,
+        "--log_dir", "log",
+        "--eval_dir", "eval",
     ]
-    if gpu:
-        cmd += ["--device", "cuda"]
-    else:
-        cmd += ["--device", "cpu"]
+    cmd += ["--gpu", "0" if gpu else "-1"]
     if extra_args:
         cmd += list(extra_args)
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(xplace_root) + os.pathsep + env.get("PYTHONPATH", "")
+    if not gpu:
+        env["CUDA_VISIBLE_DEVICES"] = ""
 
     print(f"  [xplace] $ {' '.join(cmd)} (cwd={xplace_root})")
     proc = subprocess.run(
@@ -123,12 +136,23 @@ def _run_xplace(
     if proc.returncode != 0:
         print(proc.stdout)
         raise RuntimeError(f"Xplace failed with return code {proc.returncode}")
-    # Search recursively in case Xplace nested an output dir.
-    candidates = sorted(out_dir.rglob("*.pl"))
+
+    # Xplace writes outputs to <result_dir>/<exp_id>/output/*.pl.
+    output_root = out_dir / exp_id / "output"
+    candidates: list[Path] = []
+    if output_root.exists():
+        candidates = sorted(output_root.rglob("*.pl"))
+    if not candidates:
+        # Fall back to a recursive search anywhere under out_dir.
+        candidates = sorted(out_dir.rglob("*.pl"))
     if not candidates:
         print(proc.stdout)
-        raise RuntimeError(f"Xplace produced no .pl files in {out_dir}")
-    # Prefer the largest .pl (the final post-legalization placement).
+        raise RuntimeError(f"Xplace produced no .pl files under {out_dir}")
+    # Prefer .gp.pl (global placement) over intermediates; otherwise
+    # take the largest file (usually the final legalized placement).
+    gp = [p for p in candidates if p.name.endswith(".gp.pl")]
+    if gp:
+        return gp[0]
     candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
     return candidates[0]
 

@@ -170,30 +170,45 @@ else
     EVAL_CMD=("${REPO_ROOT}/.venv/bin/evaluate")
 fi
 
-# ── Build Xplace (idempotent — skipped if XPLACE_ROOT already built) ───────
+# ── Build Xplace (idempotent — skipped if cpp_to_py/*.so already installed) ─
 build_xplace() {
     if [ ! -d "${XPLACE_ROOT}/.git" ]; then
         echo "[xplace-build] cloning ${XPLACE_REPO} (ref ${XPLACE_REF}) → ${XPLACE_ROOT}"
-        git clone --depth 1 --branch "${XPLACE_REF}" "${XPLACE_REPO}" "${XPLACE_ROOT}"
+        git clone --recursive --branch "${XPLACE_REF}" "${XPLACE_REPO}" "${XPLACE_ROOT}"
+    else
+        # Make sure submodules are present even on a re-run.
+        git -C "${XPLACE_ROOT}" submodule update --init --recursive
     fi
-    cd "${XPLACE_ROOT}"
-    # Skip rebuild if the C++/CUDA extensions are already on disk.
-    if find . -maxdepth 3 \( -name '*.so' -o -name 'build' -type d \) 2>/dev/null | grep -q .; then
-        echo "[xplace-build] artefacts already present, skipping rebuild"
-        cd "${REPO_ROOT}"
+
+    # Detect a working build: `make install` lands cpp_to_py/cpybin*.so.
+    if find "${XPLACE_ROOT}/cpp_to_py" -maxdepth 2 -name 'cpybin*.so' 2>/dev/null | grep -q .; then
+        echo "[xplace-build] cpp_to_py/cpybin*.so already present, skipping rebuild"
         return
     fi
-    if [ -f requirements.txt ]; then
-        "${PYBIN}" -m pip install -r requirements.txt || true
-    fi
-    if [ -f setup.py ]; then
-        "${PYBIN}" setup.py build_ext --inplace
-    elif [ -f CMakeLists.txt ]; then
-        mkdir -p build && cd build && cmake .. && make -j"${SLURM_CPUS_PER_TASK:-4}"
-    else
-        echo "[xplace-build] WARNING: no setup.py or CMakeLists.txt — Xplace may need manual build steps"
-    fi
+
+    # Xplace needs CMake ≥3.24, Boost ≥1.56, Cairo, CUDA ≥11.3, Torch ≥1.12.
+    # Torch comes from our venv; the rest must be module-loaded above.
+    "${PYBIN}" -m pip install --upgrade pybind11 cmake || true
+
+    mkdir -p "${XPLACE_ROOT}/build"
+    cd "${XPLACE_ROOT}/build"
+    cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=native \
+        -DPYTHON_EXECUTABLE="${PYBIN}"
+    make -j"${SLURM_CPUS_PER_TASK:-8}"
+    # CRITICAL: `make install` is what copies the built shared libs into
+    # cpp_to_py/ where Xplace's Python imports expect them.
+    make install
     cd "${REPO_ROOT}"
+
+    # Verify the import works before we commit to running anything.
+    if ! PYTHONPATH="${XPLACE_ROOT}" "${PYBIN}" -c "import cpp_to_py.cpybin" 2>&1; then
+        echo "[xplace-build] ERROR: cpp_to_py.cpybin still not importable after make install" >&2
+        find "${XPLACE_ROOT}/cpp_to_py" -name '*.so' 2>/dev/null || true
+        exit 1
+    fi
+    echo "[xplace-build] cpp_to_py.cpybin imports cleanly"
 }
 
 if [ "${SKIP_XPLACE}" = "0" ]; then
