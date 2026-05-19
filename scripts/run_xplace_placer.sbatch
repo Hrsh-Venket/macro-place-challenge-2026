@@ -188,18 +188,30 @@ build_xplace() {
 
     # Xplace needs CMake ≥3.24, Boost ≥1.56, Cairo, CUDA ≥11.3, Torch ≥1.12.
     # Torch comes from our venv; the rest must be module-loaded above.
+    # HKUST SuperPod ships cmake 3.22.1, which is too old — pip-install a
+    # modern one into the venv and call it by absolute path so the system
+    # cmake on $PATH doesn't shadow it.
     "${PYBIN}" -m pip install --upgrade pybind11 cmake || true
+
+    # Locate the venv's cmake (pip wheel drops it next to PYBIN).
+    VENV_BIN="$(dirname "${PYBIN}")"
+    if [ -x "${VENV_BIN}/cmake" ]; then
+        CMAKE_BIN="${VENV_BIN}/cmake"
+    else
+        CMAKE_BIN="$(command -v cmake || true)"
+    fi
+    echo "[xplace-build] cmake: ${CMAKE_BIN} ($("${CMAKE_BIN}" --version | head -1))"
 
     mkdir -p "${XPLACE_ROOT}/build"
     cd "${XPLACE_ROOT}/build"
-    cmake .. \
+    "${CMAKE_BIN}" .. \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES=native \
         -DPYTHON_EXECUTABLE="${PYBIN}"
-    make -j"${SLURM_CPUS_PER_TASK:-8}"
+    "${CMAKE_BIN}" --build . -- -j"${SLURM_CPUS_PER_TASK:-8}"
     # CRITICAL: `make install` is what copies the built shared libs into
     # cpp_to_py/ where Xplace's Python imports expect them.
-    make install
+    "${CMAKE_BIN}" --install .
     cd "${REPO_ROOT}"
 
     # Verify the import works before we commit to running anything.
