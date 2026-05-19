@@ -255,15 +255,29 @@ build_xplace() {
     # internal probe doesn't pick up an unsupported one and silently leave
     # _CMAKE_CUDA_WHOLE_FLAG unset.
     CUDA_HOST_GCC="$(command -v gcc)"
+    # Point cmake at nvcc explicitly. The cuda12.2 module exports
+    # CUDA_HOME=/cm/shared/apps/cuda12.2/toolkit/12.2.2.
+    CUDA_NVCC="${CUDA_HOME:+${CUDA_HOME}/bin/nvcc}"
+    [ -x "${CUDA_NVCC}" ] || CUDA_NVCC="$(command -v nvcc)"
 
     mkdir -p "${XPLACE_ROOT}/build"
     cd "${XPLACE_ROOT}/build"
-    "${CMAKE_BIN}" .. \
+    # Run cmake; if it fails, dump CMakeError.log so the real nvcc error
+    # surfaces in the build log instead of the cryptic _CMAKE_CUDA_WHOLE_FLAG.
+    if ! "${CMAKE_BIN}" .. \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCH}" \
+        -DCMAKE_CUDA_COMPILER="${CUDA_NVCC}" \
         -DCMAKE_CUDA_HOST_COMPILER="${CUDA_HOST_GCC}" \
-        -DCMAKE_CUDA_FLAGS="-allow-unsupported-compiler" \
-        -DPYTHON_EXECUTABLE="${PYBIN}"
+        -DPYTHON_EXECUTABLE="${PYBIN}"; then
+        echo "==== CMakeError.log (last 200 lines) ===="
+        tail -200 "${XPLACE_ROOT}/build/CMakeFiles/CMakeError.log" 2>/dev/null \
+            || echo "(no CMakeError.log)"
+        echo "==== CMakeOutput.log (last 100 lines) ===="
+        tail -100 "${XPLACE_ROOT}/build/CMakeFiles/CMakeOutput.log" 2>/dev/null \
+            || echo "(no CMakeOutput.log)"
+        exit 1
+    fi
     "${CMAKE_BIN}" --build . -- -j"${SLURM_CPUS_PER_TASK:-8}"
     # CRITICAL: `make install` is what copies the built shared libs into
     # cpp_to_py/ where Xplace's Python imports expect them.
