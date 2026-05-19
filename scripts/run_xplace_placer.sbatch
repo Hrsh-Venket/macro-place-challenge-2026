@@ -260,9 +260,26 @@ build_xplace() {
         if [ -f "${req}" ]; then
             echo "[xplace-deps] installing from ${req}"
             pip_install -r "${req}"
+            return
+        fi
+        echo "[xplace-deps] installing known Xplace runtime imports"
+        # PyPI deps (no ABI/CUDA constraints).
+        pip_install pandas seaborn numba igraph pulp
+
+        # torchvision must be ABI-matched to torch. PyPI's torchvision wheel
+        # may be CPU-only or built for a different CUDA — installing from
+        # there gives the classic "operator torchvision::nms does not exist"
+        # runtime error against a CUDA torch. Install from PyTorch's wheel
+        # index keyed to the CUDA version of the installed torch.
+        local torch_cu
+        torch_cu=$("${PYBIN}" -c "import torch; v=torch.version.cuda or ''; print(v.replace('.',''))" 2>/dev/null || echo "")
+        if [ -n "${torch_cu}" ]; then
+            local tv_index="https://download.pytorch.org/whl/cu${torch_cu}"
+            echo "[xplace-deps] installing torchvision from ${tv_index} (torch cuda=${torch_cu})"
+            pip_install torchvision --index-url "${tv_index}"
         else
-            echo "[xplace-deps] installing known Xplace runtime imports"
-            pip_install pandas seaborn numba igraph pulp torchvision
+            echo "[xplace-deps] torch reports no CUDA; falling back to PyPI torchvision"
+            pip_install torchvision
         fi
     }
     install_xplace_runtime_deps
