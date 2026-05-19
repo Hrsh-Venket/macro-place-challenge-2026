@@ -79,35 +79,33 @@ SLURM_STDERR="${SLURM_SUBMIT_DIR}/slurm-${SLURM_JOB_ID}.err"
 [ -e "${SLURM_STDERR}" ] && ln -sf "${SLURM_STDERR}" "${RUN_DIR}/slurm.err"
 
 # ── Modules ─────────────────────────────────────────────────────────────────
-# HKUST SuperPod module names are inconsistent across systems; try a list of
-# likely variants and let each one quietly miss. The full available list is
-# dumped to module_avail.log below for diagnosis.
-module purge 2>/dev/null || true
-for m in Anaconda3/2023.09-0 Anaconda3 anaconda3 anaconda; do
-    module load "$m" 2>/dev/null && break
-done
-for m in cuda/11.8 cuda/12.1 cuda CUDA cudatoolkit nvhpc; do
-    module load "$m" 2>/dev/null && { echo "[modules] loaded $m"; break; }
-done
-for m in gcc/9.3.0 gcc/11 gcc GCC GCCcore; do
-    module load "$m" 2>/dev/null && { echo "[modules] loaded $m"; break; }
-done
-module load cmake 2>/dev/null || true
-module load boost 2>/dev/null || true
+# HKUST SuperPod uses Bright Cluster Manager-style module names (verified
+# against https://itso.hkust.edu.hk/.../superpod/software-module-system):
+#   cuda11.8/toolkit/11.8.0    cuda12.2/toolkit/12.2.2
+#   gcc/13.1.0                 Anaconda3/2023.09-0      boost/1.81.0
+# There is NO cmake module; we pip-install it into the venv below.
+# Override at submit time:
+#   sbatch --export=ALL,CUDA_MODULE=cuda12.2/toolkit/12.2.2 ...
+: "${CUDA_MODULE:=cuda11.8/toolkit/11.8.0}"
+: "${GCC_MODULE:=gcc/13.1.0}"
+: "${BOOST_MODULE:=boost/1.81.0}"
+: "${ANACONDA_MODULE:=Anaconda3/2023.09-0}"
 
-# Fallback: if no CUDA module loaded, look for nvcc on disk and prepend it.
-if ! command -v nvcc >/dev/null 2>&1; then
-    for c in /usr/local/cuda/bin/nvcc /opt/cuda/bin/nvcc /opt/nvidia/cuda/bin/nvcc; do
-        if [ -x "$c" ]; then
-            export PATH="$(dirname "$c"):${PATH}"
-            export CUDA_HOME="$(dirname "$(dirname "$c")")"
-            echo "[modules] using system nvcc at $c (CUDA_HOME=$CUDA_HOME)"
-            break
-        fi
-    done
+module purge 2>/dev/null || true
+module load "${ANACONDA_MODULE}" 2>&1 || echo "[modules] WARN: ${ANACONDA_MODULE} not loaded"
+module load "${CUDA_MODULE}"     2>&1 || echo "[modules] WARN: ${CUDA_MODULE} not loaded"
+module load "${GCC_MODULE}"      2>&1 || echo "[modules] WARN: ${GCC_MODULE} not loaded"
+module load "${BOOST_MODULE}"    2>&1 || echo "[modules] WARN: ${BOOST_MODULE} not loaded"
+
+# Pin CUDA_HOME so cmake's FindCUDA / FindCUDAToolkit picks up the right one
+# even if the module didn't set it.
+if [ -z "${CUDA_HOME:-}" ] && command -v nvcc >/dev/null 2>&1; then
+    export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
 fi
-echo "[modules] nvcc: $(command -v nvcc || echo NOT-FOUND)  $(nvcc --version 2>/dev/null | tail -1)"
-echo "[modules] gcc:  $(command -v gcc  || echo NOT-FOUND)  $(gcc --version  2>/dev/null | head -1)"
+
+echo "[modules] nvcc: $(command -v nvcc || echo NOT-FOUND)"
+echo "[modules] gcc:  $(command -v gcc  || echo NOT-FOUND) ($(gcc --version 2>/dev/null | head -1))"
+echo "[modules] CUDA_HOME=${CUDA_HOME:-unset}"
 
 # ── Python environment: prefer uv, fall back to pip+venv ────────────────────
 # HKUST SuperPod compute nodes don't ship uv. The login-node-installed copy
