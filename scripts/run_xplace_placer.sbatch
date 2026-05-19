@@ -79,42 +79,48 @@ SLURM_STDERR="${SLURM_SUBMIT_DIR}/slurm-${SLURM_JOB_ID}.err"
 [ -e "${SLURM_STDERR}" ] && ln -sf "${SLURM_STDERR}" "${RUN_DIR}/slurm.err"
 
 # ── Modules ─────────────────────────────────────────────────────────────────
-# HKUST SuperPod uses Bright Cluster Manager-style module names (verified
-# against https://itso.hkust.edu.hk/.../superpod/software-module-system):
-#   cuda11.8/toolkit/11.8.0    cuda12.2/toolkit/12.2.2
-#   gcc/13.1.0                 Anaconda3/2023.09-0      boost/1.81.0
-# There is NO cmake module; we pip-install it into the venv below.
-#
-# Defaults: CUDA 12.2 (full sm_90 / H800 support) + system gcc (CUDA 12.2's
-# nvcc rejects gcc ≥ 14 but accepts the cluster's default 11.x; loading
-# gcc/13.1.0 explicitly previously broke nvcc's host-compiler probe and
-# caused cmake's "_CMAKE_CUDA_WHOLE_FLAG not set" error).
+# HKUST SuperPod uses Bright Cluster Manager module names (verified against
+# https://itso.hkust.edu.hk/.../superpod/software-module-system).
+# Modules that are actually NEEDED by Xplace:
+#   - Anaconda3/2023.09-0           (Python 3 + libstdc++)
+#   - cuda12.2/toolkit/12.2.2       (nvcc + libcudart for sm_90 / H800)
+# Modules we deliberately DO NOT load:
+#   - boost/1.81.0   : Xplace vendors Boost headers; loading the cluster's
+#                      Boost only mutates LD_LIBRARY_PATH for no benefit.
+#   - gcc/13.1.0     : CUDA 12.2 officially supports gcc up to 12.x. The
+#                      cluster's default system gcc is 11.4 — compatible.
+#                      Loading gcc/13.1.0 has caused nvcc host-compiler
+#                      probe failures in past runs.
+# Modules that don't exist on this cluster (we install via pip into venv):
+#   - cmake          : system is 3.22.1 (< Xplace's 3.24 minimum)
+#   - ninja, cairo, pkg-config
 #
 # Override at submit time:
 #   sbatch --export=ALL,CUDA_MODULE=cuda11.8/toolkit/11.8.0 ...
-#   sbatch --export=ALL,GCC_MODULE=gcc/13.1.0 ...   # force a specific gcc
 : "${CUDA_MODULE:=cuda12.2/toolkit/12.2.2}"
-: "${GCC_MODULE:=}"   # empty = don't override system gcc
-: "${BOOST_MODULE:=boost/1.81.0}"
 : "${ANACONDA_MODULE:=Anaconda3/2023.09-0}"
 
 module purge 2>/dev/null || true
 module load "${ANACONDA_MODULE}" 2>&1 || echo "[modules] WARN: ${ANACONDA_MODULE} not loaded"
 module load "${CUDA_MODULE}"     2>&1 || echo "[modules] WARN: ${CUDA_MODULE} not loaded"
-if [ -n "${GCC_MODULE}" ]; then
-    module load "${GCC_MODULE}"  2>&1 || echo "[modules] WARN: ${GCC_MODULE} not loaded"
-fi
-module load "${BOOST_MODULE}"    2>&1 || echo "[modules] WARN: ${BOOST_MODULE} not loaded"
 
-# Pin CUDA_HOME so cmake's FindCUDA / FindCUDAToolkit picks up the right one
-# even if the module didn't set it.
+# Pin CUDA_HOME so cmake's FindCUDAToolkit picks up the right toolkit even
+# if the module didn't export it.
 if [ -z "${CUDA_HOME:-}" ] && command -v nvcc >/dev/null 2>&1; then
     export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+fi
+
+# Make sure CUDA libs (libcudart, etc.) precede any other lib dirs in
+# LD_LIBRARY_PATH — Anaconda3 ships its own libstdc++ which can shadow the
+# system one and break nvcc's probe.
+if [ -n "${CUDA_HOME:-}" ]; then
+    export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 fi
 
 echo "[modules] nvcc: $(command -v nvcc || echo NOT-FOUND)"
 echo "[modules] gcc:  $(command -v gcc  || echo NOT-FOUND) ($(gcc --version 2>/dev/null | head -1))"
 echo "[modules] CUDA_HOME=${CUDA_HOME:-unset}"
+echo "[modules] LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-unset}"
 
 # ── Python environment: prefer uv, fall back to pip+venv ────────────────────
 # HKUST SuperPod compute nodes don't ship uv. The login-node-installed copy
@@ -219,72 +225,107 @@ build_xplace() {
         echo "[xplace-build] cloning ${XPLACE_REPO} (ref ${XPLACE_REF}) → ${XPLACE_ROOT}"
         git clone --recursive --branch "${XPLACE_REF}" "${XPLACE_REPO}" "${XPLACE_ROOT}"
     else
-        # Make sure submodules are present even on a re-run.
         git -C "${XPLACE_ROOT}" submodule update --init --recursive
     fi
 
-    # Detect a working build: `make install` lands cpp_to_py/cpybin*.so.
+    # Idempotency: `make install` lands cpp_to_py/cpybin*.so.
     if find "${XPLACE_ROOT}/cpp_to_py" -maxdepth 2 -name 'cpybin*.so' 2>/dev/null | grep -q .; then
         echo "[xplace-build] cpp_to_py/cpybin*.so already present, skipping rebuild"
         return
     fi
 
-    # Xplace needs CMake ≥3.24, Boost ≥1.56, Cairo, CUDA ≥11.3, Torch ≥1.12.
-    # Torch comes from our venv; the rest must be module-loaded above.
-    # HKUST SuperPod ships cmake 3.22.1, which is too old — pip-install a
-    # modern one into the venv and call it by absolute path so the system
-    # cmake on $PATH doesn't shadow it.
-    #
-    # Pin cmake 3.27.x: cmake 3.28 had a regression in CUDA whole-archive
-    # detection that surfaces as "_CMAKE_CUDA_WHOLE_FLAG not set".
-    pip_install --upgrade pybind11 "cmake>=3.27,<3.28" || true
+    # cmake on this cluster: system is 3.22.1 (< Xplace's 3.24 floor) and
+    # there is no cmake module → pip-install into the venv and call by
+    # absolute path. Pin cmake≥3.28: cmake 3.27 had a regression where the
+    # CUDA identification probe silently fails when CMAKE_CUDA_HOST_COMPILER
+    # is set, surfacing as "_CMAKE_CUDA_WHOLE_FLAG not set". Fixed in 3.28+.
+    pip_install --upgrade pybind11 "cmake>=3.28" || true
 
-    # Locate the venv's cmake (pip wheel drops it next to PYBIN).
     VENV_BIN="$(dirname "${PYBIN}")"
     if [ -x "${VENV_BIN}/cmake" ]; then
         CMAKE_BIN="${VENV_BIN}/cmake"
     else
         CMAKE_BIN="$(command -v cmake || true)"
     fi
-    echo "[xplace-build] cmake: ${CMAKE_BIN} ($("${CMAKE_BIN}" --version | head -1))"
 
-    # H800 = sm_90. Hard-code instead of `native` since the build sometimes
-    # runs on a CPU partition or in a container where the GPU probe fails.
-    : "${CMAKE_CUDA_ARCH:=90}"
-    # Force the CUDA host compiler to whichever gcc is on $PATH so cmake's
-    # internal probe doesn't pick up an unsupported one and silently leave
-    # _CMAKE_CUDA_WHOLE_FLAG unset.
-    CUDA_HOST_GCC="$(command -v gcc)"
-    # Point cmake at nvcc explicitly. The cuda12.2 module exports
-    # CUDA_HOME=/cm/shared/apps/cuda12.2/toolkit/12.2.2.
     CUDA_NVCC="${CUDA_HOME:+${CUDA_HOME}/bin/nvcc}"
     [ -x "${CUDA_NVCC}" ] || CUDA_NVCC="$(command -v nvcc)"
 
+    # H800 = sm_90.
+    : "${CMAKE_CUDA_ARCH:=90}"
+
+    echo "==== xplace build sanity ===="
+    echo "cmake     : ${CMAKE_BIN} ($("${CMAKE_BIN}" --version | head -1))"
+    echo "nvcc      : ${CUDA_NVCC} ($("${CUDA_NVCC}" --version | tail -1))"
+    echo "gcc       : $(command -v gcc) ($(gcc --version | head -1))"
+    echo "g++       : $(command -v g++) ($(g++ --version | head -1))"
+    echo "CUDA_HOME : ${CUDA_HOME:-unset}"
+    echo "PYBIN     : ${PYBIN}"
+    "${PYBIN}" -c "import torch; print('torch:', torch.__version__, '| cuda:', torch.cuda.is_available(), '| sm:', torch.cuda.get_arch_list() if torch.cuda.is_available() else [])" 2>&1 || true
+    echo "============================="
+
+    # ── nvcc smoke test ──────────────────────────────────────────────────
+    # Compile a trivial CUDA program with nvcc directly. If THIS fails,
+    # there's no point invoking cmake — the toolchain is broken at a
+    # lower level than cmake's probe. The error here is far easier to
+    # diagnose than cmake's cryptic "_CMAKE_CUDA_WHOLE_FLAG not set".
+    SMOKE_DIR="$(mktemp -d)"
+    cat > "${SMOKE_DIR}/probe.cu" <<'CUEOF'
+#include <cuda_runtime.h>
+#include <cstdio>
+__global__ void k() {}
+int main() {
+    int n = 0;
+    cudaGetDeviceCount(&n);
+    printf("nvcc-smoke: devices=%d\n", n);
+    return 0;
+}
+CUEOF
+    echo "[smoke] compiling probe.cu with: ${CUDA_NVCC} -arch=sm_${CMAKE_CUDA_ARCH} -std=c++17"
+    if ! "${CUDA_NVCC}" -arch="sm_${CMAKE_CUDA_ARCH}" -std=c++17 \
+            "${SMOKE_DIR}/probe.cu" -o "${SMOKE_DIR}/probe" 2>&1; then
+        echo "[smoke] FAIL — nvcc cannot compile a trivial .cu file."
+        echo "        This is a toolchain problem (nvcc/host gcc/libstdc++),"
+        echo "        not a cmake problem. Re-run the nvcc command above by"
+        echo "        hand on a compute node to see the raw error."
+        rm -rf "${SMOKE_DIR}"
+        exit 1
+    fi
+    echo "[smoke] OK — nvcc compiled probe.cu cleanly"
+    rm -rf "${SMOKE_DIR}"
+
+    # ── cmake configure ──────────────────────────────────────────────────
+    # Note: we deliberately do NOT pass -DCMAKE_CUDA_HOST_COMPILER. On
+    # cmake 3.27 that flag broke the CUDA identification probe; in cmake
+    # 3.28+ it still risks picking the wrong gcc out of an Anaconda env.
+    # nvcc's default host compiler (resolved via PATH) is gcc 11.4 on this
+    # cluster, which is supported by both CUDA 11.8 and 12.2.
     mkdir -p "${XPLACE_ROOT}/build"
     cd "${XPLACE_ROOT}/build"
-    # Run cmake; if it fails, dump CMakeError.log so the real nvcc error
-    # surfaces in the build log instead of the cryptic _CMAKE_CUDA_WHOLE_FLAG.
+    rm -f CMakeCache.txt
     if ! "${CMAKE_BIN}" .. \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCH}" \
         -DCMAKE_CUDA_COMPILER="${CUDA_NVCC}" \
-        -DCMAKE_CUDA_HOST_COMPILER="${CUDA_HOST_GCC}" \
         -DPYTHON_EXECUTABLE="${PYBIN}"; then
-        echo "==== CMakeError.log (last 200 lines) ===="
-        tail -200 "${XPLACE_ROOT}/build/CMakeFiles/CMakeError.log" 2>/dev/null \
+        echo "==== CMakeError.log (last 300 lines) ===="
+        tail -300 "${XPLACE_ROOT}/build/CMakeFiles/CMakeError.log" 2>/dev/null \
             || echo "(no CMakeError.log)"
-        echo "==== CMakeOutput.log (last 100 lines) ===="
-        tail -100 "${XPLACE_ROOT}/build/CMakeFiles/CMakeOutput.log" 2>/dev/null \
+        echo "==== CMakeOutput.log (last 150 lines) ===="
+        tail -150 "${XPLACE_ROOT}/build/CMakeFiles/CMakeOutput.log" 2>/dev/null \
             || echo "(no CMakeOutput.log)"
+        echo "==== CMakeCache.txt (CUDA/TORCH/PYTHON vars) ===="
+        grep -E '^(CMAKE_CUDA|CUDA|TORCH|PYTHON|Boost|CAIRO)' \
+            "${XPLACE_ROOT}/build/CMakeCache.txt" 2>/dev/null \
+            || echo "(no CMakeCache.txt)"
         exit 1
     fi
     "${CMAKE_BIN}" --build . -- -j"${SLURM_CPUS_PER_TASK:-8}"
-    # CRITICAL: `make install` is what copies the built shared libs into
-    # cpp_to_py/ where Xplace's Python imports expect them.
+    # `make install` is what copies the built shared libs into cpp_to_py/
+    # where Xplace's Python imports expect them.
     "${CMAKE_BIN}" --install .
     cd "${REPO_ROOT}"
 
-    # Verify the import works before we commit to running anything.
     if ! PYTHONPATH="${XPLACE_ROOT}" "${PYBIN}" -c "import cpp_to_py.cpybin" 2>&1; then
         echo "[xplace-build] ERROR: cpp_to_py.cpybin still not importable after make install" >&2
         find "${XPLACE_ROOT}/cpp_to_py" -name '*.so' 2>/dev/null || true
