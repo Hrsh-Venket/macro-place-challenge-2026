@@ -229,28 +229,40 @@ build_xplace() {
     fi
 
     # ── Xplace runtime Python deps ──────────────────────────────────────
-    # Xplace's main.py imports pandas/scipy/networkx/pyyaml at runtime, none
-    # of which are macro-place deps. We install them into the same venv so
-    # the `_run_xplace` subprocess (which invokes ${PYBIN} main.py) can find
-    # them. Done BEFORE the build-idempotency check so deps are refreshed
-    # every job, not just on rebuild — `uv sync --frozen` prunes anything
-    # outside the lockfile on each invocation, so this must re-run.
+    # Xplace's src/* modules import these at top level (loaded by `from src
+    # import *` in main.py), so they must be present before _run_xplace
+    # subprocesses ${PYBIN} main.py. None of them are macro-place deps, so
+    # they live with the Xplace build step rather than pyproject.toml.
     #
-    # On HKUST SuperPod, compute nodes may have no outbound internet; this
-    # works anyway because uv's per-user cache (~/.cache/uv) is shared
-    # across login and compute nodes, so wheels downloaded once on the
-    # login node satisfy later compute-node installs offline.
+    # Done BEFORE the build-idempotency check so deps are refreshed every
+    # job, not just on rebuild — `uv sync --frozen` (line 156) prunes
+    # anything outside the lockfile on each invocation, so this must re-run.
+    #
+    # On HKUST SuperPod, compute nodes do have PyPI access (verified by the
+    # existing cmake/pybind11 install path) and uv's per-user cache at
+    # ~/.cache/uv is on the shared HOME, so wheels are reused across jobs.
+    #
+    # List derived from import-scan of cuhk-eda/Xplace main:
+    #   pandas   — utils/tools.py
+    #   seaborn  — src/core/route_force.py            (top-level)
+    #   numba    — src/nesterov_optimizer.py et al.   (top-level)
+    #   igraph   — src/core/macro_legalization.py     (macro legalization)
+    #   pulp     — src/core/macro_legalization.py     (LP solver)
+    #   torchvision — src/core/route_force.py         (top-level; must
+    #                 match installed torch version — pip resolves this)
+    # Deliberately NOT installed (lazy imports, only fire on --vis which
+    # is disabled by the draw_placement patch above):
+    #   cv2 (opencv-python), cairocffi
+    # Xplace ships no requirements.txt/environment.yml — this list IS
+    # authoritative for the upstream commit on $XPLACE_REF.
     install_xplace_runtime_deps() {
         local req="${XPLACE_ROOT}/requirements.txt"
         if [ -f "${req}" ]; then
             echo "[xplace-deps] installing from ${req}"
             pip_install -r "${req}"
         else
-            # Fallback: known runtime imports in upstream Xplace main.py +
-            # cpp_to_py helpers. Keep this list tight — every entry here is
-            # a wheel uv has to fetch the first time a user runs this job.
-            echo "[xplace-deps] no requirements.txt in Xplace, installing known set"
-            pip_install pandas pyyaml networkx scipy
+            echo "[xplace-deps] installing known Xplace runtime imports"
+            pip_install pandas seaborn numba igraph pulp torchvision
         fi
     }
     install_xplace_runtime_deps
