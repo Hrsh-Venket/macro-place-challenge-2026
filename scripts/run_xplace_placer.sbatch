@@ -228,10 +228,18 @@ build_xplace() {
         git -C "${XPLACE_ROOT}" submodule update --init --recursive
     fi
 
-    # Idempotency: `make install` lands cpp_to_py/cpybin*.so.
-    if find "${XPLACE_ROOT}/cpp_to_py" -maxdepth 2 -name 'cpybin*.so' 2>/dev/null | grep -q .; then
-        echo "[xplace-build] cpp_to_py/cpybin*.so already present, skipping rebuild"
+    # Idempotency: don't just check for .so files — verify the package
+    # actually imports under the current venv. This catches ABI drift
+    # (e.g., torch was upgraded and now needs the new C++11 ABI).
+    if PYTHONPATH="${XPLACE_ROOT}" "${PYBIN}" -c "import cpp_to_py.cpybin" 2>/dev/null; then
+        echo "[xplace-build] cpp_to_py.cpybin imports cleanly — skipping rebuild"
         return
+    fi
+    # If the import fails but .so files exist, they're from a previous bad
+    # build (wrong ABI, etc.). Wipe them so cmake/make redo a clean build.
+    if find "${XPLACE_ROOT}/cpp_to_py/cpybin" -maxdepth 1 -name '*.so' 2>/dev/null | grep -q .; then
+        echo "[xplace-build] cleaning stale .so files from previous build"
+        rm -rf "${XPLACE_ROOT}/build" "${XPLACE_ROOT}/cpp_to_py/cpybin"/*.so
     fi
 
     # Patch out draw_placement: HKUST SuperPod has no Cairo (no module, no
@@ -264,6 +272,14 @@ build_xplace() {
     # H800 = sm_90.
     : "${CMAKE_CUDA_ARCH:=90}"
 
+    # Match torch's C++ ABI. PyTorch ≥2.4 CUDA wheels are built with the NEW
+    # C++11 ABI (_GLIBCXX_USE_CXX11_ABI=1); Xplace's CMakeLists defaults to
+    # the OLD ABI (=0). Mismatch surfaces at import time as:
+    #   undefined symbol: _ZN3c106detail14torchCheckFailEPKcS2_jRKSs
+    # ("Ss" is the old-ABI mangling for std::string; new-ABI torch doesn't
+    # export it.)
+    CXX11_ABI="$("${PYBIN}" -c "import torch; print(int(torch.compiled_with_cxx11_abi()))" 2>/dev/null || echo 0)"
+
     echo "==== xplace build sanity ===="
     echo "cmake     : ${CMAKE_BIN} ($("${CMAKE_BIN}" --version | head -1))"
     echo "nvcc      : ${CUDA_NVCC} ($("${CUDA_NVCC}" --version | tail -1))"
@@ -271,6 +287,7 @@ build_xplace() {
     echo "g++       : $(command -v g++) ($(g++ --version | head -1))"
     echo "CUDA_HOME : ${CUDA_HOME:-unset}"
     echo "PYBIN     : ${PYBIN}"
+    echo "CXX11_ABI : ${CXX11_ABI} (torch.compiled_with_cxx11_abi())"
     "${PYBIN}" -c "import torch; print('torch:', torch.__version__, '| cuda:', torch.cuda.is_available(), '| sm:', torch.cuda.get_arch_list() if torch.cuda.is_available() else [])" 2>&1 || true
     echo "============================="
 
@@ -317,6 +334,7 @@ CUEOF
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCH}" \
         -DCMAKE_CUDA_COMPILER="${CUDA_NVCC}" \
+        -DCMAKE_CXX_ABI="${CXX11_ABI}" \
         -DPYTHON_EXECUTABLE="${PYBIN}"; then
         echo "==== CMakeError.log (last 300 lines) ===="
         tail -300 "${XPLACE_ROOT}/build/CMakeFiles/CMakeError.log" 2>/dev/null \
