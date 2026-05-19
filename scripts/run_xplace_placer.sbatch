@@ -266,20 +266,27 @@ build_xplace() {
         # PyPI deps (no ABI/CUDA constraints).
         pip_install pandas seaborn numba igraph pulp
 
-        # torchvision must be ABI-matched to torch. PyPI's torchvision wheel
-        # may be CPU-only or built for a different CUDA — installing from
-        # there gives the classic "operator torchvision::nms does not exist"
-        # runtime error against a CUDA torch. Install from PyTorch's wheel
-        # index keyed to the CUDA version of the installed torch.
-        local torch_cu
+        # torchvision must be ABI-matched to torch on TWO axes:
+        #   1. CUDA toolkit version → use PyTorch's wheel index for the
+        #      cuXXX matching torch.version.cuda.
+        #   2. torchvision version  → pin to 0.(torch_minor+15).*.  E.g.
+        #      torch 2.10 → torchvision 0.25.  Without this pin, uv picks
+        #      latest torchvision (0.27 today), which declares torch==2.12
+        #      and silently upgrades torch + replaces its CUDA stack. Next
+        #      job's `uv sync --frozen` then reverts torch but leaves the
+        #      CUDA libs pruned → libcudnn.so.9 import error.
+        # --no-deps belt-and-braces: even with a correct pin, prevents
+        # uv from touching the locked torch installation.
+        local torch_cu tv_spec
         torch_cu=$("${PYBIN}" -c "import torch; v=torch.version.cuda or ''; print(v.replace('.',''))" 2>/dev/null || echo "")
+        tv_spec=$("${PYBIN}" -c "import torch; m=int(torch.__version__.split('.')[1]); print(f'torchvision==0.{m+15}.*')" 2>/dev/null || echo "torchvision")
         if [ -n "${torch_cu}" ]; then
             local tv_index="https://download.pytorch.org/whl/cu${torch_cu}"
-            echo "[xplace-deps] installing torchvision from ${tv_index} (torch cuda=${torch_cu})"
-            pip_install torchvision --index-url "${tv_index}"
+            echo "[xplace-deps] installing ${tv_spec} from ${tv_index} (--no-deps, torch cuda=${torch_cu})"
+            pip_install "${tv_spec}" --no-deps --index-url "${tv_index}"
         else
-            echo "[xplace-deps] torch reports no CUDA; falling back to PyPI torchvision"
-            pip_install torchvision
+            echo "[xplace-deps] torch reports no CUDA; PyPI ${tv_spec} (--no-deps)"
+            pip_install "${tv_spec}" --no-deps
         fi
     }
     install_xplace_runtime_deps
