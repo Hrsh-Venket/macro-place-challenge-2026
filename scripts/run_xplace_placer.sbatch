@@ -234,6 +234,16 @@ build_xplace() {
         return
     fi
 
+    # Patch out draw_placement: HKUST SuperPod has no Cairo (no module, no
+    # system headers), and we don't need the --vis PNG renderer to score
+    # benchmarks. Without this patch, cmake configure fails with
+    # "CAIRO_INCLUDE_DIRS set to NOTFOUND".
+    CPP_CMAKE="${XPLACE_ROOT}/cpp_to_py/CMakeLists.txt"
+    if grep -q '^add_subdirectory(draw_placement)' "${CPP_CMAKE}"; then
+        sed -i 's|^add_subdirectory(draw_placement)|# add_subdirectory(draw_placement)  # disabled: no Cairo on HKUST SuperPod|' "${CPP_CMAKE}"
+        echo "[xplace-build] patched out draw_placement (no Cairo on cluster)"
+    fi
+
     # cmake on this cluster: system is 3.22.1 (< Xplace's 3.24 floor) and
     # there is no cmake module → pip-install into the venv and call by
     # absolute path. Pin cmake≥3.28: cmake 3.27 had a regression where the
