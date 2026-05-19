@@ -84,17 +84,26 @@ SLURM_STDERR="${SLURM_SUBMIT_DIR}/slurm-${SLURM_JOB_ID}.err"
 #   cuda11.8/toolkit/11.8.0    cuda12.2/toolkit/12.2.2
 #   gcc/13.1.0                 Anaconda3/2023.09-0      boost/1.81.0
 # There is NO cmake module; we pip-install it into the venv below.
+#
+# Defaults: CUDA 12.2 (full sm_90 / H800 support) + system gcc (CUDA 12.2's
+# nvcc rejects gcc ≥ 14 but accepts the cluster's default 11.x; loading
+# gcc/13.1.0 explicitly previously broke nvcc's host-compiler probe and
+# caused cmake's "_CMAKE_CUDA_WHOLE_FLAG not set" error).
+#
 # Override at submit time:
-#   sbatch --export=ALL,CUDA_MODULE=cuda12.2/toolkit/12.2.2 ...
-: "${CUDA_MODULE:=cuda11.8/toolkit/11.8.0}"
-: "${GCC_MODULE:=gcc/13.1.0}"
+#   sbatch --export=ALL,CUDA_MODULE=cuda11.8/toolkit/11.8.0 ...
+#   sbatch --export=ALL,GCC_MODULE=gcc/13.1.0 ...   # force a specific gcc
+: "${CUDA_MODULE:=cuda12.2/toolkit/12.2.2}"
+: "${GCC_MODULE:=}"   # empty = don't override system gcc
 : "${BOOST_MODULE:=boost/1.81.0}"
 : "${ANACONDA_MODULE:=Anaconda3/2023.09-0}"
 
 module purge 2>/dev/null || true
 module load "${ANACONDA_MODULE}" 2>&1 || echo "[modules] WARN: ${ANACONDA_MODULE} not loaded"
 module load "${CUDA_MODULE}"     2>&1 || echo "[modules] WARN: ${CUDA_MODULE} not loaded"
-module load "${GCC_MODULE}"      2>&1 || echo "[modules] WARN: ${GCC_MODULE} not loaded"
+if [ -n "${GCC_MODULE}" ]; then
+    module load "${GCC_MODULE}"  2>&1 || echo "[modules] WARN: ${GCC_MODULE} not loaded"
+fi
 module load "${BOOST_MODULE}"    2>&1 || echo "[modules] WARN: ${BOOST_MODULE} not loaded"
 
 # Pin CUDA_HOME so cmake's FindCUDA / FindCUDAToolkit picks up the right one
@@ -225,7 +234,10 @@ build_xplace() {
     # HKUST SuperPod ships cmake 3.22.1, which is too old — pip-install a
     # modern one into the venv and call it by absolute path so the system
     # cmake on $PATH doesn't shadow it.
-    pip_install --upgrade pybind11 cmake || true
+    #
+    # Pin cmake 3.27.x: cmake 3.28 had a regression in CUDA whole-archive
+    # detection that surfaces as "_CMAKE_CUDA_WHOLE_FLAG not set".
+    pip_install --upgrade pybind11 "cmake>=3.27,<3.28" || true
 
     # Locate the venv's cmake (pip wheel drops it next to PYBIN).
     VENV_BIN="$(dirname "${PYBIN}")"
@@ -236,11 +248,21 @@ build_xplace() {
     fi
     echo "[xplace-build] cmake: ${CMAKE_BIN} ($("${CMAKE_BIN}" --version | head -1))"
 
+    # H800 = sm_90. Hard-code instead of `native` since the build sometimes
+    # runs on a CPU partition or in a container where the GPU probe fails.
+    : "${CMAKE_CUDA_ARCH:=90}"
+    # Force the CUDA host compiler to whichever gcc is on $PATH so cmake's
+    # internal probe doesn't pick up an unsupported one and silently leave
+    # _CMAKE_CUDA_WHOLE_FLAG unset.
+    CUDA_HOST_GCC="$(command -v gcc)"
+
     mkdir -p "${XPLACE_ROOT}/build"
     cd "${XPLACE_ROOT}/build"
     "${CMAKE_BIN}" .. \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_CUDA_ARCHITECTURES=native \
+        -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCH}" \
+        -DCMAKE_CUDA_HOST_COMPILER="${CUDA_HOST_GCC}" \
+        -DCMAKE_CUDA_FLAGS="-allow-unsupported-compiler" \
         -DPYTHON_EXECUTABLE="${PYBIN}"
     "${CMAKE_BIN}" --build . -- -j"${SLURM_CPUS_PER_TASK:-8}"
     # CRITICAL: `make install` is what copies the built shared libs into
