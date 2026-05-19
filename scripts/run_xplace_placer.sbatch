@@ -79,12 +79,35 @@ SLURM_STDERR="${SLURM_SUBMIT_DIR}/slurm-${SLURM_JOB_ID}.err"
 [ -e "${SLURM_STDERR}" ] && ln -sf "${SLURM_STDERR}" "${RUN_DIR}/slurm.err"
 
 # ── Modules ─────────────────────────────────────────────────────────────────
-module purge
-module load Anaconda3/2023.09-0 2>/dev/null || module load Anaconda3 2>/dev/null || true
-module load cuda/11.8 2>/dev/null || module load cuda 2>/dev/null || true
-module load gcc/9.3.0 2>/dev/null || module load gcc 2>/dev/null || true
+# HKUST SuperPod module names are inconsistent across systems; try a list of
+# likely variants and let each one quietly miss. The full available list is
+# dumped to module_avail.log below for diagnosis.
+module purge 2>/dev/null || true
+for m in Anaconda3/2023.09-0 Anaconda3 anaconda3 anaconda; do
+    module load "$m" 2>/dev/null && break
+done
+for m in cuda/11.8 cuda/12.1 cuda CUDA cudatoolkit nvhpc; do
+    module load "$m" 2>/dev/null && { echo "[modules] loaded $m"; break; }
+done
+for m in gcc/9.3.0 gcc/11 gcc GCC GCCcore; do
+    module load "$m" 2>/dev/null && { echo "[modules] loaded $m"; break; }
+done
 module load cmake 2>/dev/null || true
 module load boost 2>/dev/null || true
+
+# Fallback: if no CUDA module loaded, look for nvcc on disk and prepend it.
+if ! command -v nvcc >/dev/null 2>&1; then
+    for c in /usr/local/cuda/bin/nvcc /opt/cuda/bin/nvcc /opt/nvidia/cuda/bin/nvcc; do
+        if [ -x "$c" ]; then
+            export PATH="$(dirname "$c"):${PATH}"
+            export CUDA_HOME="$(dirname "$(dirname "$c")")"
+            echo "[modules] using system nvcc at $c (CUDA_HOME=$CUDA_HOME)"
+            break
+        fi
+    done
+fi
+echo "[modules] nvcc: $(command -v nvcc || echo NOT-FOUND)  $(nvcc --version 2>/dev/null | tail -1)"
+echo "[modules] gcc:  $(command -v gcc  || echo NOT-FOUND)  $(gcc --version  2>/dev/null | head -1)"
 
 # ── Python environment: prefer uv, fall back to pip+venv ────────────────────
 # HKUST SuperPod compute nodes don't ship uv. The login-node-installed copy
@@ -120,6 +143,7 @@ setup_with_uv() {
     uv sync --frozen
     PYRUN="uv run"
     PYBIN="${REPO_ROOT}/.venv/bin/python"
+    USED_UV=1
     return 0
 }
 
@@ -148,12 +172,24 @@ setup_with_pip() {
 
     PYRUN="${VENV}/bin/python -m"
     PYBIN="${VENV}/bin/python"
+    USED_UV=0
     return 0
 }
 
+USED_UV=0
 if ! setup_with_uv; then
     setup_with_pip
 fi
+
+# ── pip helper: `uv sync` creates pip-less venvs, so route installs via
+# `uv pip install` when we're on the uv path. ────────────────────────────────
+pip_install() {
+    if [ "${USED_UV}" = "1" ]; then
+        uv pip install "$@"
+    else
+        "${PYBIN}" -m pip install "$@"
+    fi
+}
 
 # Verify the evaluate entry-point is reachable, regardless of how we got here.
 if ! ${PYBIN} -c "from macro_place import evaluate" >/dev/null 2>&1; then
@@ -191,7 +227,7 @@ build_xplace() {
     # HKUST SuperPod ships cmake 3.22.1, which is too old — pip-install a
     # modern one into the venv and call it by absolute path so the system
     # cmake on $PATH doesn't shadow it.
-    "${PYBIN}" -m pip install --upgrade pybind11 cmake || true
+    pip_install --upgrade pybind11 cmake || true
 
     # Locate the venv's cmake (pip wheel drops it next to PYBIN).
     VENV_BIN="$(dirname "${PYBIN}")"
@@ -245,6 +281,20 @@ fi
     echo
     echo "Python runner : ${PYRUN}"
     echo "Python venv   : ${PYBIN}"
+    echo "Used uv       : ${USED_UV}"
+    echo
+    echo "── module list (currently loaded) ─────────────────────────────────"
+    module list 2>&1 || echo "(module command unavailable)"
+    echo
+    echo "── module avail (first 80 lines) ──────────────────────────────────"
+    module avail 2>&1 | head -80 || true
+    echo
+    echo "── toolchain ──────────────────────────────────────────────────────"
+    echo "cmake: $(command -v cmake) $(cmake --version 2>/dev/null | head -1)"
+    echo "nvcc:  $(command -v nvcc)  $(nvcc --version 2>/dev/null | tail -1)"
+    echo "gcc:   $(command -v gcc)   $(gcc --version 2>/dev/null | head -1)"
+    echo "CUDA_HOME=${CUDA_HOME:-unset}"
+    echo
     "${PYBIN}" -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available(), 'device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')" \
         || echo "(torch import failed)"
     echo
